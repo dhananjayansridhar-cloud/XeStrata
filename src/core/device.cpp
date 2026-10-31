@@ -684,6 +684,10 @@ uint64_t max_alloc_limit_bytes() {
 // Unsupported ParamName", UR_DEVICE_INFO_IS_INTEGRATED_GPU) and report it absent.  The HIP runtime says the same as
 // unified host memory (hipDeviceAttributeIntegrated), which is asked in its place.
 bool integrated_gpu(const sycl::device& d) {
+    // Level Zero alone answers the aspect query cleanly.  Both HIP and CUDA print an error line on stderr each time
+    // it is asked ("Unsupported ParamName in urDeviceGetInfo ... IS_INTEGRATED_GPU") before saying false, six times a
+    // start with intel/llvm v7.2.0 (upstream ruc1j 07fe81d3); HIP's runtime says the same thing as unified host
+    // memory, asked in its place, and CUDA has no integrated devices at all so it is skipped outright.
     const sycl::backend b = d.get_backend();
     if (b == sycl::backend::ext_oneapi_level_zero) return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
     if (b != sycl::backend::ext_oneapi_hip) return false;
