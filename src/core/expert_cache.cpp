@@ -351,6 +351,12 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
+    if (seg_req_ > 0 && !strata::gpu::vmem_supported()) {
+        // upstream 9f0794e99: a runtime without virtual memory starts all the same, the cache one block, with a line
+        std::fprintf(stderr, "ExpertCache: --vram-elastic is off: this GPU's runtime offers no virtual memory "
+                             "(sycl_ext_oneapi_virtual_mem); the cache is one block\n");
+        seg_req_ = 0;
+    }
     if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
