@@ -68,6 +68,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
+                            anthropic_tools,
                             custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
@@ -236,6 +237,26 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+
+
+class ContextOverflow(ValueError):
+    """A request that does not fit the context (a 400 on every API). It keeps the numbers, so /v1/messages can also say
+    it the way Anthropic's API does: a client that decides from the wording (Claude Code compacts on "prompt is too
+    long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does for
+    Anthropic's own error (#4838)."""
+
+    def __init__(self, text, *, prompt, context, max_new=None):
+        super().__init__(text)
+        self.prompt, self.context, self.max_new = prompt, context, max_new
+
+    def anthropic_text(self) -> str:
+        largest = self.context - CTX_SLACK - 1     # the largest prompt that still leaves a token
+        if self.max_new is None or self.prompt > largest:     # the prompt alone leaves no room
+            return f"prompt is too long: {self.prompt} tokens > {largest} maximum; {self}"
+        return (f"input length and `max_tokens` exceed context limit: {self.prompt} + {self.max_new} > "
+                f"{self.context - CTX_SLACK}; {self}")
+
+
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -1147,6 +1168,11 @@ class StrataEngine:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught (issue "
                         "#29 there is upstream Strata's). Its log line: " + line.strip() + " - please report it at "
                         "github.com/MistVVK/XeStrata/issues.")
+        err = self.last_err or ""
+        if err.startswith("fatal GPU error"):    # #4350: the engine ended itself; the next request starts it again
+            return ("The graphics card reported a fatal error (" + err[len("fatal GPU error:"):].strip()[:160]
+                    + "), so the engine ended. The next request starts it again. If this repeats, please report it at "
+                    "github.com/ruc1j/XeStrata-890M/issues with the log.")
         proc = self.proc                                 # None while a restart has not started the next one yet
         rc = proc.poll() if proc is not None else None
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
@@ -1471,6 +1497,7 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
+                self._raise_if_fatal_gpu(line)
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
@@ -1508,6 +1535,18 @@ class StrataEngine:
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+
+    def _raise_if_fatal_gpu(self, line: str) -> None:
+        """#4350: the engine's ERR line "fatal GPU error: ..." means it is ending (its GPU context is gone).  The
+        request in flight fails as an engine death (a 503 the client can send again), not as a bad request (400), and
+        the engine counts as ended, so the next request starts it again at once instead of finding a closed pipe."""
+        text = line[4:].strip()
+        if not text.startswith("fatal GPU error"):
+            return
+        self.last_err = text
+        self.ended = True
+        raise EngineDied("the GPU reported a fatal error and the engine ended: "
+                         + text[len("fatal GPU error:"):].strip()[:200])
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine
@@ -2215,6 +2254,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    self._raise_if_fatal_gpu(line)
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -3680,6 +3720,37 @@ class Service:
         except Exception:
             return None
 
+    # fatal GPU errors of one engine within FATAL_GPU_WINDOW_S: after that it is not started again
+    FATAL_GPU_MAX = 3
+    FATAL_GPU_WINDOW_S = 600.0
+
+    def _note_fatal_gpu_exit(self, code) -> None:
+        """#4350: the engine ends itself after a fatal GPU error (the device context cannot be used again) and says so
+        in its last ERR line.  The next request starts it again, like any engine death, with one plain line here; the
+        request that was in flight already failed with a 503.  Three such deaths within ten minutes mean a restart will
+        not help (a bad card, driver or model state): then the server stops starting it and says so (503), until the
+        ten minutes have passed."""
+        why = getattr(self.engine, "last_err", None) or ""
+        if "fatal GPU error" not in why:
+            return
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        seen = self.__dict__.setdefault("_fatal_gpu_pids", set())
+        times = self.__dict__.setdefault("_fatal_gpu_times", [])
+        now = time.time()
+        if pid not in seen:                              # one death counts once, however many requests find it dead
+            seen.add(pid)
+            times.append(now)
+        times[:] = [t for t in times if now - t < self.FATAL_GPU_WINDOW_S]
+        minutes = f"{self.FATAL_GPU_WINDOW_S / 60:g}"
+        print(f"[strata] the GPU reported a fatal error ({why[len('fatal GPU error:'):].strip()[:160]}); the engine "
+              f"ended (exit code {code}) and is started again; the request that was running failed and can be sent "
+              f"again ({len(times)} of {self.FATAL_GPU_MAX} allowed in {minutes} minutes)", flush=True)
+        if len(times) >= self.FATAL_GPU_MAX:
+            raise EngineDied(f"the GPU reported a fatal error {len(times)} times in {minutes} minutes, so "
+                             "the engine is not started again (the last: " + why[:160] + "). Check the graphics "
+                             "driver, the card's temperature and power, and the log; a request after "
+                             f"{minutes} minutes tries again")
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
@@ -3748,6 +3819,7 @@ class Service:
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+            self._note_fatal_gpu_exit(code)
             print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
@@ -4424,21 +4496,23 @@ class Service:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
                 # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                      f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's xestrata-<model>.json to shorten it to the room left (#545)")
-            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
-                  f"leaves that much of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
-            max_new = max(1, room)          # a shorter completion beats a 400 (the default; upstream f31b6efd6)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                      f"({ctx}); requests are never truncated. Send a smaller "
+                                      f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true "
+                                      "to the model's xestrata-<model>.json to shorten it to the room left (#545)",
+                                      prompt=len(ids), context=ctx, max_new=max_new)
+            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves "
+                  "that much "
+                  f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
+            max_new = max(1, room)          # a shorter completion beats a 400 (the default)
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -4595,13 +4669,14 @@ class Service:
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         strict = (sampling or {}).get("strata_strict_tools")
         if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
             rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
-            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only),
+            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only,
+                                              deferred),
                                      strict)
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -4650,7 +4725,7 @@ class Service:
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
                   reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True, recover=self.tool_call_recovery,
-                         declared_only=declared_only))
+                         declared_only=declared_only, deferred=deferred))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -6077,7 +6152,7 @@ def anthropic_usage(ids, reused, output_tokens: int) -> dict:
             "cache_read_input_tokens": reused, "output_tokens": output_tokens}
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, deferred=False):
     mid = "msg_" + uuid.uuid4().hex[:24]
 
     def start(reused):
@@ -6099,7 +6174,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True,
+                           deferred=deferred):
         if kind == "ping":
             yield None
             continue
@@ -7875,8 +7951,9 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
+            callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
-                tools = None
+                tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
                                 getattr(svc.template, "call_form", "qwen"))
             messages, validator = anthropic_prepare_format(req, messages, tools)
@@ -7886,14 +7963,19 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            try:
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            except ContextOverflow as overflow:
+                # #4838: Anthropic's own wording first, Strata's sentence after it
+                raise ValueError(overflow.anthropic_text()) from None
             strict, patterns = constrained_tools(req.get("tools"))
             svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
                                else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
             svc.check_strict(req, tools, strict)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force,
+                                      deferred=deferred)
             if validator is not None:
                 events = anthropic_structured(events, validator)
             events = self._capture(events, "anthropic")
@@ -8655,26 +8737,46 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
+def _history_call_names(req) -> list:
+    """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an
+    assistant message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call /
+    custom_tool_call input items, a namespace in front as `namespace.name`)."""
+    names = []
+    for message in req.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names.append(block.get("name"))
+    items = req.get("input")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
+            name = item.get("name")
+            if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
+                name = f"{item['namespace']}.{name}"
+            names.append(name)
+    return names
+
+
 def with_history_tools(tools, req) -> list:
     """#4663 (upstream 3282c6134): an agent's tool set changes between turns (deferred tools, MCP servers, a compacted
     history), and the model calls a tool it used earlier in this conversation that this turn's `tools` no longer lists.
     That call came back as raw text with finish_reason "stop", and the client took it for prose and stopped.  A name the
-    conversation's own assistant messages called is a tool the client has, so it counts as declared (the call comes back
-    as a tool call; the client says what it does with it).  Nothing is added when the request declared no tools at all,
-    or for a name that is already declared."""
+    conversation's own assistant turns called is a tool the client has, so it counts as declared (the call comes back
+    as a tool call; the client says what it does with it) - on Chat Completions, Anthropic and Responses.  Nothing is
+    added when the request declared no tools at all, or for a name that is already declared."""
     if not tools or not isinstance(req, dict):
         return tools
     try:
         have = {t.get("name") for t in tools if isinstance(t, dict)}
         extra = []
-        for message in req.get("messages") or []:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            for call in message.get("tool_calls") or []:
-                name = (call.get("function") or {}).get("name") if isinstance(call, dict) else None
-                if isinstance(name, str) and name and name not in have:
-                    have.add(name)
-                    extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        for name in _history_call_names(req):
+            if isinstance(name, str) and name and name not in have:
+                have.add(name)
+                extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
         return [*tools, *extra] if extra else tools
     except Exception:
         return tools
