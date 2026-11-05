@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.8-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.11-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -31,6 +31,24 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.57 の取り込み
+
+upstream の Strata 0.2.9 から 0.2.11（エンジン 0.1.55 から 0.1.57）のエンジン・serve・setup の変更を Xe に取り込みました。当て方は [ruc1j/XeStrata-890M](https://github.com/ruc1j/XeStrata-890M)（この本体を AMD の統合 GPU 1 つ向けに作ったフォークで、23 個のフォークと 6 個の独立したクローンのうち upstream の 0.2.8 より先を追っている唯一のもの）の該当するコミットを参照に cherry-pick し、890M 固有の前提（`uma_host_cache` の host USM のエキスパートキャッシュ、そのフォーク自身の版・変更履歴の記述）を外して、この本体の履歴の上に置き直したものです。
+外したもの: そのフォーク自身の DFlash2 drafter の移植（このハードウェアでは使えないとすでに計測済み）と、upstream が 0.2.11 で足した 12 行・16 行の prompt lookup の窓（ruc1j のフォークも「自分の GPU では速くならない」とだけ README に書いて入れていません。このハードウェアで効くかどうかは未確認です）。
+
+取り込んだもの（括弧は upstream の Issue 番号）:
+
+- repeat・frequency・presence のペナルティは、答えが書いたトークンだけを数え、プロンプトは数えません（#4590）。`STRATA_PENALTY_PROMPT=1` で前の窓に戻ります。
+- 要求は答えがまだ出せる行だけを commit します（#4677。`STRATA_SERVE_STOP_BOUND=0` で切ります）。
+- 致命の GPU のエラーのあとは `ERR fatal GPU error: ...` を出してエンジンを終え、サーバーがその場の要求を 503 で返して次の要求でエンジンを起動し直します。ハングせずに済みます（#4350）。SYCL には sticky error がないので、失敗した呼び出し自身のエラーの文を読みます。`STRATA_INJECT_FATAL=N` は試験の仕掛けです。
+- PLE の表を固定する前に memlock の soft limit を hard limit まで上げ、arena の RAM の待ちがそれでも足りないときはその固定を返します（#4671、#4846）。
+- pack が BF16 のまま持つ射影は、ネイティブカーネルがないまま素通りさせず、きょうだいと同じ Q8_0 にして出します（#4741）。
+- 仮想メモリのない runtime で `--vram-elastic` を指定しても拒むのではなく、キャッシュを 1 ブロックにして同じように起動します。
+- serve: Anthropic 形式のツール検索（`/v1/messages`、遅延ツールと MCP）。会話で既に呼んだツール名は、このターンの `tools` が挙げていなくても宣言済みとして扱います（ターンごとにツールの集まりが変わるエージェント: 遅延のツール、MCP、圧縮した履歴）。コードフェンスや字下げしたコードブロックの中の呼び出しは実行せず文として読みます。`/v1/messages` の context overflow のエラーは Anthropic 自身の書き方で始まるようになり、その書き方で判定するクライアント（Claude Code など）が正しく動きます。
+- setup: Unsloth が 2026-11-04 に出し直した Qwen3.8-Flash-Next の Dynamic v3.1 の量子化セット（UD-IQ1_M、UD-Q2_0、UD-IQ2_XS、UD-Q2_K_XL、UD-IQ3_XXS、UD-Q3_K_XL、UD-IQ4_XS-v31）をカタログに入れました。experimental の印つきです: ruc1j のフォーク自身のハードウェアでも動かしておらず、ここでもまだ動かしていません。proxy の向こうでダウンロードが止まったときはその案内を出します。読み取り専用のモデルフォルダーの完了の印は XeStrata 自身のフォルダーに置きます。
+
+取り込んでいない、まだ残っている作業: upstream の 0.2.9 から 0.2.11 の NVIDIA・gfx12・split エンジン・layer split の変更です。ruc1j のフォークは AMD の GPU 1 つだけのビルドなので、ここが一番関わる dual-vendor の `--layer-split` の構成にまったく触れていません。upstream 0.2.11 の `pcie_share_rule` の変更（CPU と PCIe リンクの分担の上限、0.60 から 0.95）がこの中で decode の速さに一番関わりそうですが、移植も計測もまだです。
 
 ## Strata 0.2.8 の取り込み
 

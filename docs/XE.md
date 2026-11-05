@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.8-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.11-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -30,6 +30,23 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.2.11
+
+The engine, serve and setup changes of upstream Strata 0.2.9 through 0.2.11 (engine 0.1.55 to 0.1.57) are carried into Xe, using [ruc1j/XeStrata-890M](https://github.com/ruc1j/XeStrata-890M) (a fork of this repository for a single AMD integrated GPU, the only one of 23 forks and 6 independent clones tracking Strata past 0.2.8) as a reference for the hunks: its engine/serve/setup commits were cherry-picked and adapted away from its iGPU-specific assumptions (`uma_host_cache`, the host-USM expert cache, its own version and changelog entries), onto this fork's own history.
+Excluded outright: that fork's own DFlash2 drafter port (already measured here as not useful on this hardware), and the 12/16-line prompt lookup window upstream added in 0.2.11, which ruc1j's fork also left out (its own README says only that it did not help their GPU; whether it helps here is unchecked).
+
+What is taken (upstream issue numbers in parentheses):
+
+- The repeat, frequency and presence penalties count only the tokens the reply itself has written, not the prompt (#4590); `STRATA_PENALTY_PROMPT=1` restores the old window.
+- A request commits only the rows its answer can still emit (#4677; `STRATA_SERVE_STOP_BOUND=0` turns it off).
+- After a fatal GPU error the engine ends with `ERR fatal GPU error: ...` so the server can 503 the request in flight and start the engine again on the next one, instead of hanging (#4350). SYCL keeps no sticky error, so the text of the failed call's own error is read instead; `STRATA_INJECT_FATAL=N` is a test hook.
+- The memlock soft limit is raised to the hard limit before the PLE table is pinned, and the pin is given back if the arena's RAM wait still falls short (#4671, #4846).
+- A projection a pack keeps unquantized (BF16) is served as Q8_0 like its siblings instead of having no native kernel at all (#4741).
+- `--vram-elastic` on a runtime with no virtual memory starts all the same, with the cache in one block, instead of refusing.
+- Serve: Anthropic-style tool search (`/v1/messages`, deferred and MCP tools); a tool name the conversation already called counts as declared even where this turn's `tools` does not list it (agents whose tool set changes between turns: deferred tools, MCP, a compacted history); a call inside a code fence or an indented code block is read as text, not executed; the context-overflow error on `/v1/messages` now opens the way Anthropic's own does, so a client that pattern-matches on the wording (as Claude Code does) acts on it correctly.
+- Setup: the Unsloth Dynamic v3.1 Qwen3.8-Flash-Next quant sets Unsloth re-uploaded on 2026-11-04 (UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS-v31) are in the catalog, marked experimental: untested on this fork's own hardware by ruc1j, and not yet run here either. A download stuck behind a proxy is told so; a read-only model folder's finish mark goes into XeStrata's own folder instead.
+
+Not taken, and still open work: the NVIDIA, gfx12, split-engine and layer-split changes of upstream 0.2.9 through 0.2.11, which ruc1j's fork (a single-GPU, AMD-only build) does not touch at all and which matter most for this fork's dual-vendor `--layer-split` configuration. Upstream 0.2.11's `pcie_share_rule` change (the CPU/PCIe-link-share ceiling, 0.60 to 0.95) is the most likely of these to affect decode speed here; it has not been ported or measured.
 ## Integration through Strata 0.2.8
 
 The changes of upstream Strata 0.2.7 to 0.2.8 (`870aedd9`) are carried into Xe.
