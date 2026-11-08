@@ -2129,7 +2129,23 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) {
+        // upstream #5096: a split window may serve the next group's empty plan while an earlier group's DMA is still
+        // in flight; raising flag B directly here could pass that upload (the GPU consumer then reads staging before
+        // it is ready).  Once copy_ has carried a DMA this run, keep the empty group's flag ordered behind it too.
+        if (!v->copy_used_) { raise_flag(v->h_flagB_, want); return; }
+        FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
+        fs.flag = v->h_flagB_;
+        fs.value = want;
+        FlagSet* set = &fs;
+        if (!strata::gpu::launch_host(v->copy_, [set] { raise_flag(set->flag, set->value); })) {
+            std::fprintf(stderr, "strata DMA: empty-group completion failed\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+        return;
+    }
+    v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, v->copy_);
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];

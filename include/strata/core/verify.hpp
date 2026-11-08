@@ -562,6 +562,7 @@ private:
     strata::gpu::Event* commit_done_ = nullptr;   // recorded after an async commit (set_commit_async)
     bool commit_pending_ = false;
     strata::gpu::Stream copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    bool copy_used_ = false;   // upstream #5096: an empty group's flag-B raise must stay ordered behind copy_'s DMA once it has carried one
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
