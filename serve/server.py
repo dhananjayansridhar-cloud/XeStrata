@@ -3800,6 +3800,7 @@ class Service:
         self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
+        self.undeclared_tool_calls = "text"   # upstream #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
@@ -5108,7 +5109,8 @@ class Service:
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
                   reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True, recover=self.tool_call_recovery,
-                         declared_only=declared_only, deferred=deferred))
+                         declared_only=declared_only,
+                         deferred=deferred or self.undeclared_tool_calls == "call"))   # upstream #4622: opt-in, as for a deferred tool
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -9204,6 +9206,19 @@ def with_history_tools(tools, req) -> list:
         return tools
 
 
+def undeclared_tool_calls_setting(cfg: dict) -> str:
+    """upstream #4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it)
+    keeps a well-formed call of a tool the request did not declare as the text the model wrote, with
+    strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has its own policy for
+    unknown names (it answers the model with the tool names it has).  Anything else stops the start."""
+    mode = cfg.get("undeclared_tool_calls")
+    if mode is None:                                  # the environment names it too (STRATA_UNDECLARED_TOOL_CALLS); the config wins
+        mode = os.environ.get("STRATA_UNDECLARED_TOOL_CALLS") or "text"
+    if mode not in ("text", "call"):
+        raise SystemExit(f"[strata] config \"undeclared_tool_calls\" must be \"text\" or \"call\", not {mode!r}")
+    return mode
+
+
 def tool_call_recovery_setting(cfg: dict) -> bool:
     """The config's "tool_call_recovery" (see OutputParser's recover): on when the config does not name it,
     "tool_call_recovery": false turns it off.  Anything but true or false stops the start."""
@@ -9549,6 +9564,7 @@ def _main() -> int:
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
