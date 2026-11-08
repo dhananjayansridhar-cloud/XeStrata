@@ -32,6 +32,21 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.2.12 からの個別の修正
+
+Strata 0.2.12 は 2026-11-07 にリリースされ、まだこれを追う fork はありません（ruc1j/XeStrata-890M はまだ 0.2.11 のままでした）。そのためこれは `Niko1221/Strata` 自身のソースを読んで手で移した個別の修正であって、版の取り込み全体ではありません。`STRATA_UPSTREAM_VERSION` は 0.2.11 のままです。選んだのは、本当に存在するバグか、このフォークの dual-vendor（AMD HIP + NVIDIA CUDA）の `--layer-split` の構成に直接関わるものだけで、リリース全体の機械的な移植ではありません:
+
+- `verify.cpp`: 空の PCIe-DMA のエキスパートの組が、前の組のコピーがまだ終わっていないうちに完了フラグを上げてしまうことがあり、GPU が準備前の staging を読むことがありました（upstream #5096: 直す前は 14 件中 7 件の要求が nonfinite の logits を出し、直した後は 0 件）。このフォークの `fetch_dma()` に同じ形があることを確認し、同じ直し方（生の CUDA 呼び出しではなく、このフォーク自身の `strata::gpu::launch_host` を通す形）で直しました。
+- `generate.cpp`: `--pipeline-windows 2` と `--adapt-async 1` を layer split で使うと、adaptive tier のパイプライン側が、serial 側が読む常駐マークの範囲を一度も設定しないままでした。答えが窓の途中で終わると、新しく入れ替えたエキスパートが印をつけられないまま次の入れ替えで失われます（upstream #4844、4.5 日のエージェント利用で decode が 60 から 40 tok/s に落ちたと計測）。存在を確認し、直しました。
+- `ple_reader.cpp`: `PleReader::issue()` は、同じページの miss をまとめるためだけに、呼ぶたびにハッシュの map とベクタをヒープに確保し、それでも結局ソートし直していました。このフォークが使う経路（direct-SSD の PLE ストリーミング）のホットパスです。upstream #4910 はスタックの配列に 1 回だけソートする形に置き換え、ジョブも順番も変えません。
+- `frontend.py`: 複数のツールがあるときの forced な `tool_choice` は、名前のない `<function=` だけを答えの頭に置いていて、Qwen3.8 がそのあとに存在しない名前を書いてしまうことがありました（upstream #4828: 直す前は forced-choice の実行 24 回中 0 回しか本物のツールを選べず、直した後は 24 回中 24 回）。
+- `frontend.py`: ツール呼び出しのパーサーを頑丈にする 3 つの直し（upstream #5409、#5276、#5281）— コードモードのハーネス自身のツールの綴りがネイティブな呼び出しに漏れる場合、`<toolcall>`／`<tool-call>` という綴り間違いの開き、名前空間付きの MCP ツールを末尾の部分だけで通す場合です。
+- `server.py`: 新しい設定 `"undeclared_tool_calls": "call"`（upstream #4622）は、宣言されていないツールの、形の整った呼び出しを文として返す代わりに、ツール呼び出しとして返します。ターンごとに宣言するツールの集まりが変わるクライアント（遅延ツールや MCP を使うハーネス）向けです。
+
+contrib-llvm だけでビルドして試しました（NVIDIA sm_89 と AMD gfx1100、intel/llvm 7.2.0、Windows）。free モードは未検証です。C++ の直しはビルドが通ることまでの確認で、`native_expert_parity` と実機のエンジンの起動は GPU が空く番を待っています。Python 側の変更には独自の試験があり、`test_frontend.py` は全体、`test_server.ForcedToolChoice` と `ModelAliases` は通ります（28/28、16/16）。
+
+取り込まなかったもの、その理由: `#5108`（ggml の CUDA MMQ の行の表を読み過ぎるバグ）は、このフォーク自身が繰り返し起こすクラッシュと一見似ていましたが、まったく別の仕組みでした — 実際のクラッシュは intel/llvm 自身の SYCL Unified Runtime の CUDA アダプター（`unified-runtime/source/adapters/cuda/event.cpp` と `enqueue.cpp`）の中の `CUDA_ERROR_INVALID_CONTEXT` で、手元にあるすべてのログを `copy_i32` で探しても一度も見つからず（実際の症状の文字列は繰り返し見つかりました）、確かめた上で外しました。`STRATA_ADAPT_FETCH` は GPU 1 つ、`--pipeline-windows` なし、`--adapt-async` なしが条件で、この 3 つすべてをこのフォークの dual-GPU の構成が使っているため、移していないのではなく仕組みとして当てはまりません。`#3559` の hyper-connection の VRAM 節約は、既存の `STRATA_HC_Q8` の経路がすでに同じことをしています。`#5158` は upstream の別の「split engine」と mixed-quant の配置の話で、このフォークの `--layer-split` とは違います。
+
 ## Strata 0.1.57 の取り込み
 
 upstream の Strata 0.2.9 から 0.2.11（エンジン 0.1.55 から 0.1.57）のエンジン・serve・setup の変更を Xe に取り込みました。当て方は [ruc1j/XeStrata-890M](https://github.com/ruc1j/XeStrata-890M)（この本体を AMD の統合 GPU 1 つ向けに作ったフォークで、23 個のフォークと 6 個の独立したクローンのうち upstream の 0.2.8 より先を追っている唯一のもの）の該当するコミットを参照に cherry-pick し、890M 固有の前提（`uma_host_cache` の host USM のエキスパートキャッシュ、そのフォーク自身の版・変更履歴の記述）を外して、この本体の履歴の上に置き直したものです。
