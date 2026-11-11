@@ -43,6 +43,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
+#include "strata/prefill/timer_marks.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -1829,6 +1830,10 @@ struct PfTimer {
     double ms[kPfCount] = {};
     void mark(int phase, strata::gpu::Stream s) {
         if (!on) return;
+        // upstream #4006: the gap between two consecutive marks is charged to the earlier mark's phase either way, so
+        // a second mark in the same phase (e.g. compute() recording "dequant" once per expert) adds nothing but an
+        // extra cudaEventRecord submission - ~80 us under WDDM (Windows) per MMQ group's worth of experts.
+        if (timer_mark_repeats(ph.data(), used, phase)) return;
         if (used == ev.size()) {
             strata::gpu::Event* e = nullptr;
             strata::gpu::event_create(&e, true);
