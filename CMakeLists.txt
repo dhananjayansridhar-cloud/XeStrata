@@ -555,6 +555,12 @@ if(STRATA_ENABLE_XE)
   set(_strata_math_hip "${_strata_hip_archs}")
   if(WIN32)
     set(_strata_rocm_win_hip "${STRATA_SYCL_WINDOWS}/../hip")
+    if(NOT STRATA_SYCL_WINDOWS)
+      # a native Windows build (no cross-compile toolchain file, so STRATA_SYCL_WINDOWS stays empty): AMD's own
+      # installer puts rocBLAS's and the Windows HIP runtime's import libraries in the same tree, unlike the cross
+      # build's separate staging beside the SYCL runtime (tools/intel_llvm_build.py --windows)
+      set(_strata_rocm_win_hip "${STRATA_ROCM_WINDOWS_LIBS}")
+    endif()
     if(_strata_math_hip AND EXISTS "${STRATA_ROCM_WINDOWS_LIBS}/lib/rocblas.lib"
        AND EXISTS "${_strata_rocm_win_hip}/lib/amdhip64.lib")
       # the fork's rocBLAS backend takes these in a cross build for Windows
